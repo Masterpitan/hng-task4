@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+VPC Control Tool - Virtual Private Cloud implementation using Linux networking primitives
+HNG Internship Task 4
+"""
+
+import os
+import sys
+import json
+import subprocess
+import argparse
+import ipaddress
+import hashlib
+import logging
+import datetime
+from pathlib import Path
+
+class VPCManager:
+    def __init__(self):
+        if os.name == 'nt':  # Windows
+            self.vpc_config_dir = Path(os.environ.get('TEMP', 'C:\\temp')) / "vpcctl"
+        else:  # Linux/Unix
+            self.vpc_config_dir = Path("/tmp/vpcctl")
+        self.vpc_config_dir.mkdir(exist_ok=True)
+
+        # Setup logging
+        self.logs_dir = self.vpc_config_dir / "logs"
+        self.logs_dir.mkdir(exist_ok=True)
+        self.setup_logging()
+
+    def setup_logging(self):
+        """Setup comprehensive logging for all VPC operations"""
+        # Create main log file
+        log_file = self.logs_dir / "vpc-operations.log"
+
+        # Setup logger
+        self.logger = logging.getLogger('vpcctl')
+        self.logger.setLevel(logging.INFO)
+
+        # Create file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+
+        # Add handler to logger
+        if not self.logger.handlers:
+            self.logger.addHandler(file_handler)
+
+    def _short_name(self, name, max_len=10):
+        """Generate short name for interfaces (max 15 chars for Linux)"""
+        if len(name) <= max_len:
+            return name
+        # Use first part + hash for uniqueness
+        hash_part = hashlib.md5(name.encode()).hexdigest()[:4]
+        return f"{name[:max_len-5]}{hash_part}"
+
+    def run_cmd(self, cmd, check=True, capture=True):
+        """Execute shell command with comprehensive logging"""
+        print(f"[CMD] {cmd}")
+        self.logger.info(f"Executing command: {cmd}")
+
+        try:
+            if capture:
+                result = subprocess.run(cmd, shell=True, check=check,
+                                      capture_output=True, text=True)
+                if result.stdout.strip():
+                    print(f"[OUT] {result.stdout.strip()}")
+                    self.logger.info(f"Command output: {result.stdout.strip()}")
+                if result.stderr.strip():
+                    self.logger.warning(f"Command stderr: {result.stderr.strip()}")
+                return result
+            else:
+                result = subprocess.run(cmd, shell=True, check=check)
+                self.logger.info(f"Command executed successfully (no capture)")
+                return result
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Command failed: {e}"
+            print(f"[ERR] {error_msg}")
+            self.logger.error(error_msg)
+            if capture and e.stderr:
+                stderr_msg = e.stderr.strip()
+                print(f"[ERR] {stderr_msg}")
+                self.logger.error(f"Command stderr: {stderr_msg}")
+            if check:
+                raise
+            return e
+
+    def create_vpc(self, vpc_name, cidr_block):
+        """Create a new VPC with specified CIDR"""
+        print(f"\n=== Creating VPC: {vpc_name} with CIDR: {cidr_block} ===")
+        self.logger.info(f"Starting VPC creation: {vpc_name} with CIDR: {cidr_block}")
+
+        # Validate CIDR
+        try:
+            network = ipaddress.IPv4Network(cidr_block, strict=False)
+        except ValueError as e:
+            print(f"[ERR] Invalid CIDR block: {e}")
+            return False
+
+        # Check if VPC already exists
+        vpc_config = self.vpc_config_dir / f"{vpc_name}.json"
+        if vpc_config.exists():
+            print(f"[ERR] VPC {vpc_name} already exists")
+            return False
+
+        # Create bridge for VPC
+        bridge_name = f"br-{self._short_name(vpc_name, 12)}"
+        try:
+            self.run_cmd(f"ip link add {bridge_name} type bridge")
+            self.run_cmd(f"ip link set {bridge_name} up")
+
+            # Assign gateway IP (first usable IP in CIDR)
+            gateway_ip = str(list(network.hosts())[0])
+            self.run_cmd(f"ip addr add {gateway_ip}/{network.prefixlen} dev {bridge_name}")
+
+            # Save VPC configuration
+            config = {
+                "name": vpc_name,
+                "cidr": cidr_block,
+                "bridge": bridge_name,
+                "gateway": gateway_ip,
+                "subnets": {}
+            }
+
+            with open(vpc_config, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            print(f"[OK] VPC {vpc_name} created successfully")
+            print(f"[OK] Bridge: {bridge_name}, Gateway: {gateway_ip}")
+            self.logger.info(f"VPC {vpc_name} created successfully - Bridge: {bridge_name}, Gateway: {gateway_ip}")
+            return True
+
+        except Exception as e:
+            error_msg = f"Failed to create VPC {vpc_name}: {e}"
+            print(f"[ERR] {error_msg}")
+            self.logger.error(error_msg)
+            # Cleanup on failure
+            self.run_cmd(f"ip link delete {bridge_name}", check=False)
+            return False
+
+    def add_subnet(self, vpc_name, subnet_name, subnet_cidr, subnet_type="private"):
+        """Add subnet to existing VPC"""
+        print(f"\n=== Adding {subnet_type} subnet: {subnet_name} ({subnet_cidr}) to VPC: {vpc_name} ===")
+
+        vpc_config_file = self.vpc_config_dir / f"{vpc_name}.json"
+        if not vpc_config_file.exists():
+            print(f"[ERR] VPC {vpc_name} does not exist")
+            return False
+
+        with open(vpc_config_file, 'r') as f:
+            config = json.load(f)
+
+        # Validate subnet CIDR is within VPC CIDR
+        try:
+            vpc_network = ipaddress.IPv4Network(config["cidr"])
+            subnet_network = ipaddress.IPv4Network(subnet_cidr)
+            if not subnet_network.subnet_of(vpc_network):
+                print(f"[ERR] Subnet CIDR {subnet_cidr} not within VPC CIDR {config['cidr']}")
+                return False
+        except ValueError as e:
+            print(f"[ERR] Invalid subnet CIDR: {e}")
+            return False
+
+        # Create network namespace for subnet
+        ns_name = f"{self._short_name(vpc_name, 6)}-{self._short_name(subnet_name, 6)}"
+        veth_host = f"vh-{self._short_name(subnet_name, 10)}"
+        veth_ns = f"vn-{self._short_name(subnet_name, 10)}"
+
+        try:
+            # Create namespace
+            self.run_cmd(f"ip netns add {ns_name}")
+
+            # Create veth pair
+            self.run_cmd(f"ip link add {veth_host} type veth peer name {veth_ns}")
+
+            # Move one end to namespace
+            self.run_cmd(f"ip link set {veth_ns} netns {ns_name}")
+
+            # Connect host end to bridge
+            self.run_cmd(f"ip link set {veth_host} master {config['bridge']}")
+            self.run_cmd(f"ip link set {veth_host} up")
+
+            # Configure namespace interface
+            subnet_ip = str(list(subnet_network.hosts())[0])
+            self.run_cmd(f"ip netns exec {ns_name} ip link set lo up")
+            self.run_cmd(f"ip netns exec {ns_name} ip link set {veth_ns} up")
+            self.run_cmd(f"ip netns exec {ns_name} ip addr add {subnet_ip}/{subnet_network.prefixlen} dev {veth_ns}")
+
+            # Add route to gateway network first, then default route
+            gateway_network = ipaddress.IPv4Network(f"{config['gateway']}/24", strict=False)
+            if not subnet_network.overlaps(gateway_network):
+                self.run_cmd(f"ip netns exec {ns_name} ip route add {gateway_network} dev {veth_ns}")
+            self.run_cmd(f"ip netns exec {ns_name} ip route add default via {config['gateway']}")
+
+            # Configure NAT for public subnets
+            if subnet_type == "public":
+                self.setup_nat(vpc_name, subnet_cidr)
+
+            # Update configuration
+            config["subnets"][subnet_name] = {
+                "cidr": subnet_cidr,
+                "type": subnet_type,
+                "namespace": ns_name,
+                "ip": subnet_ip,
+                "veth_host": veth_host,
+                "veth_ns": veth_ns
+            }
+
+            with open(vpc_config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            print(f"[OK] Subnet {subnet_name} added successfully")
+            print(f"[OK] Namespace: {ns_name}, IP: {subnet_ip}")
+            return True
+
+        except Exception as e:
+            print(f"[ERR] Failed to add subnet: {e}")
+            # Cleanup on failure
+            self.run_cmd(f"ip netns delete {ns_name}", check=False)
+            self.run_cmd(f"ip link delete {veth_host}", check=False)
+            return False
+
+    def setup_nat(self, vpc_name, subnet_cidr):
+        """Setup NAT for public subnet internet access"""
+        print(f"[INFO] Setting up NAT for subnet {subnet_cidr}")
+
+        # Get default interface for internet access
+        result = self.run_cmd("ip route | grep default | awk '{print $5}' | head -1")
+        if result.stdout.strip():
+            internet_iface = result.stdout.strip()
+
+            # Enable IP forwarding
+            self.run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
+
+            # Add MASQUERADE rule for NAT
+            self.run_cmd(f"iptables -t nat -A POSTROUTING -s {subnet_cidr} -o {internet_iface} -j MASQUERADE")
+            self.run_cmd(f"iptables -A FORWARD -i br-{self._short_name(vpc_name, 12)} -o {internet_iface} -j ACCEPT")
+            self.run_cmd(f"iptables -A FORWARD -i {internet_iface} -o br-{self._short_name(vpc_name, 12)} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+
+            print(f"[OK] NAT configured for internet access via {internet_iface}")
+
+    def apply_security_policy(self, vpc_name, policy_file):
+        """Apply security group rules from JSON policy"""
+        print(f"\n=== Applying security policy from {policy_file} ===")
+
+        if not os.path.exists(policy_file):
+            print(f"[ERR] Policy file {policy_file} not found")
+            return False
+
+        with open(policy_file, 'r') as f:
+            policy = json.load(f)
+
+        vpc_config_file = self.vpc_config_dir / f"{vpc_name}.json"
+        with open(vpc_config_file, 'r') as f:
+            config = json.load(f)
+
+        subnet_cidr = policy.get("subnet")
+        if not subnet_cidr:
+            print("[ERR] No subnet specified in policy")
+            return False
+
+        # Find matching subnet
+        target_subnet = None
+        for subnet_name, subnet_info in config["subnets"].items():
+            if subnet_info["cidr"] == subnet_cidr:
+                target_subnet = subnet_info
+                break
+
+        if not target_subnet:
+            print(f"[ERR] Subnet {subnet_cidr} not found in VPC {vpc_name}")
+            return False
+
+        ns_name = target_subnet["namespace"]
+
+        # Apply ingress rules
+        for rule in policy.get("ingress", []):
+            port = rule["port"]
+            protocol = rule["protocol"]
+            action = rule["action"].upper()
+
+            if action == "ALLOW":
+                iptables_action = "ACCEPT"
+            elif action == "DENY":
+                iptables_action = "DROP"
+            else:
+                continue
+
+            cmd = f"ip netns exec {ns_name} iptables -A INPUT -p {protocol} --dport {port} -j {iptables_action}"
+            self.run_cmd(cmd)
+            print(f"[OK] Applied rule: {action} {protocol}/{port}")
+
+        return True
+
+    def peer_vpcs(self, vpc1_name, vpc2_name):
+        """Create peering connection between two VPCs"""
+        print(f"\n=== Creating VPC peering: {vpc1_name} <-> {vpc2_name} ===")
+
+        vpc1_config_file = self.vpc_config_dir / f"{vpc1_name}.json"
+        vpc2_config_file = self.vpc_config_dir / f"{vpc2_name}.json"
+
+        if not vpc1_config_file.exists() or not vpc2_config_file.exists():
+            print("[ERR] One or both VPCs do not exist")
+            return False
+
+        with open(vpc1_config_file, 'r') as f:
+            vpc1_config = json.load(f)
+        with open(vpc2_config_file, 'r') as f:
+            vpc2_config = json.load(f)
+
+        # Create veth pair for peering
+        peer_veth1 = f"p1-{self._short_name(vpc1_name, 5)}{self._short_name(vpc2_name, 5)}"
+        peer_veth2 = f"p2-{self._short_name(vpc2_name, 5)}{self._short_name(vpc1_name, 5)}"
+
+        try:
+            self.run_cmd(f"ip link add {peer_veth1} type veth peer name {peer_veth2}")
+
+            # Connect to respective bridges
+            self.run_cmd(f"ip link set {peer_veth1} master {vpc1_config['bridge']}")
+            self.run_cmd(f"ip link set {peer_veth2} master {vpc2_config['bridge']}")
+
+            # Bring up interfaces
+            self.run_cmd(f"ip link set {peer_veth1} up")
+            self.run_cmd(f"ip link set {peer_veth2} up")
+
+            # Add routes for cross-VPC communication
+            self.run_cmd(f"ip route add {vpc2_config['cidr']} via {vpc2_config['gateway']} dev {vpc1_config['bridge']}")
+            self.run_cmd(f"ip route add {vpc1_config['cidr']} via {vpc1_config['gateway']} dev {vpc2_config['bridge']}")
+
+            print(f"[OK] VPC peering established between {vpc1_name} and {vpc2_name}")
+            return True
+
+        except Exception as e:
+            print(f"[ERR] Failed to create peering: {e}")
+            return False
+
+    def deploy_app(self, vpc_name, subnet_name, app_type="nginx", port=80):
+        """Deploy test application in subnet"""
+        print(f"\n=== Deploying {app_type} in {vpc_name}/{subnet_name} ===")
+
+        vpc_config_file = self.vpc_config_dir / f"{vpc_name}.json"
+        with open(vpc_config_file, 'r') as f:
+            config = json.load(f)
+
+        if subnet_name not in config["subnets"]:
+            print(f"[ERR] Subnet {subnet_name} not found")
+            return False
+
+        ns_name = config["subnets"][subnet_name]["namespace"]
+
+        if app_type == "nginx":
+            # Simple HTTP server using Python
+            cmd = f"ip netns exec {ns_name} python3 -m http.server {port} --directory /tmp &"
+            self.run_cmd(cmd, check=False, capture=False)
+        elif app_type == "python":
+            # Custom Python HTTP server
+            server_script = f"""
+import http.server
+import socketserver
+PORT = {port}
+Handler = http.server.SimpleHTTPRequestHandler
+with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    print(f"Server running on port {port}")
+    httpd.serve_forever()
+"""
+            script_file = f"/tmp/server_{ns_name}.py"
+            with open(script_file, 'w') as f:
+                f.write(server_script)
+            cmd = f"ip netns exec {ns_name} python3 {script_file} &"
+            self.run_cmd(cmd, check=False, capture=False)
+
+        print(f"[OK] {app_type} server deployed on port {port}")
+        return True
+
+    def test_connectivity(self, vpc_name, subnet_name, target_ip):
+        """Test connectivity from subnet to target IP"""
+        print(f"\n=== Testing connectivity from {vpc_name}/{subnet_name} to {target_ip} ===")
+
+        vpc_config_file = self.vpc_config_dir / f"{vpc_name}.json"
+        with open(vpc_config_file, 'r') as f:
+            config = json.load(f)
+
+        ns_name = config["subnets"][subnet_name]["namespace"]
+
+        # Test ping
+        try:
+            result = self.run_cmd(f"ip netns exec {ns_name} ping -c 3 {target_ip}")
+            print(f"[OK] Ping successful to {target_ip}")
+            return True
+        except:
+            print(f"[FAIL] Ping failed to {target_ip}")
+            return False
+
+    def list_vpcs(self):
+        """List all VPCs"""
+        print("\n=== VPC List ===")
+        vpc_files = list(self.vpc_config_dir.glob("*.json"))
+
+        if not vpc_files:
+            print("No VPCs found")
+            return
+
+        for vpc_file in vpc_files:
+            with open(vpc_file, 'r') as f:
+                config = json.load(f)
+            print(f"VPC: {config['name']}")
+            print(f"  CIDR: {config['cidr']}")
+            print(f"  Bridge: {config['bridge']}")
+            print(f"  Gateway: {config['gateway']}")
+            print(f"  Subnets: {len(config['subnets'])}")
+            for subnet_name, subnet_info in config["subnets"].items():
+                print(f"    - {subnet_name}: {subnet_info['cidr']} ({subnet_info['type']})")
+
+    def delete_vpc(self, vpc_name):
+        """Delete VPC and all associated resources"""
+        print(f"\n=== Deleting VPC: {vpc_name} ===")
+
+        vpc_config_file = self.vpc_config_dir / f"{vpc_name}.json"
+        if not vpc_config_file.exists():
+            print(f"[ERR] VPC {vpc_name} does not exist")
+            return False
+
+        with open(vpc_config_file, 'r') as f:
+            config = json.load(f)
+
+        # Delete subnets
+        for subnet_name, subnet_info in config["subnets"].items():
+            print(f"[INFO] Deleting subnet {subnet_name}")
+
+            # Delete namespace
+            self.run_cmd(f"ip netns delete {subnet_info['namespace']}", check=False)
+
+            # Delete veth pair
+            self.run_cmd(f"ip link delete {subnet_info['veth_host']}", check=False)
+
+            # Remove NAT rules for public subnets
+            if subnet_info["type"] == "public":
+                self.run_cmd(f"iptables -t nat -D POSTROUTING -s {subnet_info['cidr']} -j MASQUERADE", check=False)
+
+        # Delete bridge
+        self.run_cmd(f"ip link delete {config['bridge']}", check=False)
+
+        # Remove configuration file
+        vpc_config_file.unlink()
+
+        print(f"[OK] VPC {vpc_name} deleted successfully")
+        return True
+
+def main():
+    parser = argparse.ArgumentParser(description="VPC Control Tool")
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+    # Create VPC
+    create_parser = subparsers.add_parser('create-vpc', help='Create a new VPC')
+    create_parser.add_argument('name', help='VPC name')
+    create_parser.add_argument('cidr', help='CIDR block (e.g., 10.0.0.0/16)')
+
+    # Add subnet
+    subnet_parser = subparsers.add_parser('add-subnet', help='Add subnet to VPC')
+    subnet_parser.add_argument('vpc_name', help='VPC name')
+    subnet_parser.add_argument('subnet_name', help='Subnet name')
+    subnet_parser.add_argument('subnet_cidr', help='Subnet CIDR')
+    subnet_parser.add_argument('--type', choices=['public', 'private'], default='private', help='Subnet type')
+
+    # Apply security policy
+    policy_parser = subparsers.add_parser('apply-policy', help='Apply security policy')
+    policy_parser.add_argument('vpc_name', help='VPC name')
+    policy_parser.add_argument('policy_file', help='JSON policy file')
+
+    # VPC peering
+    peer_parser = subparsers.add_parser('peer-vpcs', help='Create VPC peering')
+    peer_parser.add_argument('vpc1', help='First VPC name')
+    peer_parser.add_argument('vpc2', help='Second VPC name')
+
+    # Deploy app
+    deploy_parser = subparsers.add_parser('deploy-app', help='Deploy test application')
+    deploy_parser.add_argument('vpc_name', help='VPC name')
+    deploy_parser.add_argument('subnet_name', help='Subnet name')
+    deploy_parser.add_argument('--type', choices=['nginx', 'python'], default='python', help='App type')
+    deploy_parser.add_argument('--port', type=int, default=80, help='Port number')
+
+    # Test connectivity
+    test_parser = subparsers.add_parser('test', help='Test connectivity')
+    test_parser.add_argument('vpc_name', help='VPC name')
+    test_parser.add_argument('subnet_name', help='Subnet name')
+    test_parser.add_argument('target_ip', help='Target IP address')
+
+    # List VPCs
+    subparsers.add_parser('list', help='List all VPCs')
+
+    # Delete VPC
+    delete_parser = subparsers.add_parser('delete-vpc', help='Delete VPC')
+    delete_parser.add_argument('name', help='VPC name')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    # Check if running with admin privileges
+    if os.name == 'nt':  # Windows
+        try:
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                print("[ERR] This tool requires administrator privileges on Windows.")
+                print("Please run as administrator or use run-as-admin.bat")
+                sys.exit(1)
+        except:
+            print("[WARN] Could not verify admin privileges on Windows")
+    else:  # Linux/Unix
+        if os.geteuid() != 0:
+            print("[ERR] This tool requires root privileges. Please run with sudo.")
+            sys.exit(1)
+
+    vpc_manager = VPCManager()
+
+    if args.command == 'create-vpc':
+        vpc_manager.create_vpc(args.name, args.cidr)
+    elif args.command == 'add-subnet':
+        vpc_manager.add_subnet(args.vpc_name, args.subnet_name, args.subnet_cidr, args.type)
+    elif args.command == 'apply-policy':
+        vpc_manager.apply_security_policy(args.vpc_name, args.policy_file)
+    elif args.command == 'peer-vpcs':
+        vpc_manager.peer_vpcs(args.vpc1, args.vpc2)
+    elif args.command == 'deploy-app':
+        vpc_manager.deploy_app(args.vpc_name, args.subnet_name, args.type, args.port)
+    elif args.command == 'test':
+        vpc_manager.test_connectivity(args.vpc_name, args.subnet_name, args.target_ip)
+    elif args.command == 'list':
+        vpc_manager.list_vpcs()
+    elif args.command == 'delete-vpc':
+        vpc_manager.delete_vpc(args.name)
+
+if __name__ == "__main__":
+    main()
